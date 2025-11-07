@@ -1,4 +1,4 @@
-# Constrained_cell_migration
+# A geometric-surface PDE model for cell-nucleus translocation through confinement
 This repository contains the FEniCSx implementation for finite element simulations of a geometric surface partial differential equation (GS-PDE) model describing the motion of a cell and its nucleus during migration through a confined microchannel.
 # Features
 Implements the Finite Element Method (FEM) to simulate cell and nuclear motion under confinement.
