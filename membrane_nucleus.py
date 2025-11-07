@@ -480,25 +480,6 @@ while (round(t + dt, 9) <= Ttot):
 out_ce.Close()
 out_n.Close()
 
-# def figConfArea(fig, ax):
-#     ax.set_ylabel(r"$A$ [$\mu$m$^2$]")
-#     ax.legend([r"$A_\mathrm{cell}$", r"$A_\mathrm{n}$"])
-#     return fig, ax
-# fig, ax = Plot2DLines(data, ["Time"], ["Area_ce", "Area_n"], figConf = figConfArea)
-# fig.savefig("results/" + results_name + "_area.png", dpi=300, bbox_inches='tight')
-# def figConfPeri(fig, ax):
-#     ax.set_ylabel(r"$P$ [$\mu$m]")
-#     ax.legend([r"$P_\mathrm{cell}$", r"$P_\mathrm{n}$"])
-#     return fig, ax
-# fig, ax = Plot2DLines(data, ["Time"], ["Peri_ce", "Peri_n"], figConf = figConfPeri)
-# fig.savefig("results/" + results_name + "_peri.png", dpi = 300)
-# def figConfVel(fig, ax):
-#     ax.set_ylabel(r"$|\mathbf{v}_\mathrm{cell}|$ [$\mu$m/min]")
-#     ax.legend([r"$|\mathbf{v}_\mathrm{cell}|$"])
-#     return fig, ax
-# fig, ax = Plot2DLines(data, ["Time"], ["Vel_ce"], figConf = figConfVel)
-# fig.savefig("results/" + results_name + "_velocity.png", dpi = 300)
-# End analysis
 mprint("-----------------------------------------", rank = rank)
 mprint("End computation", rank = rank)
 # Report elapsed real time for the analysis
