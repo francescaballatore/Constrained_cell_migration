@@ -91,18 +91,18 @@ opre0_ce = 0.0
 opre0_n = 0.0
 # Results name
 results_name = "membrane_nucleus/resu" # Time scheme
-Ttot = 3.5
+Ttot = 2.00
 dt = 1.0e-3 
 print_each = 1
 #Viscous force
-omega = 1e-1 
+omega = 0.1
 # Repulsive force
 rep_tol = 1.0e-1
 rep_mag = 1.0e0
 rep_st  = 5.0e0
 rep_normal_tol = -0.7
 # Cytoplasm force
-Fc = 16 # force magnitude
+Fc = 16.0 # force magnitude
 # External barrier
 # bmDia = 10.0
 # bmHeight = 6.0
@@ -121,11 +121,11 @@ Fbarrier = 30.0
 steepness = 3.5
 # Mechanical forces
 E_ce = 0.0103
-nu_ce = 0.45
 E_n = 5.0
-nu_n = 0.45
-eta1 = 0.02 #8
-eta2 = 0.3 #30
+eta1_ce = 0.02/100 
+eta2_ce = 0.3/100 
+eta1_n = 0.02 
+eta2_n = 0.3 
 # Nucleus to cytoplasm force
 k_n = 10.0
 factor = 4
@@ -140,9 +140,9 @@ quadrature_degree = 8
 def SetSolverOpt(solver):
     # Newton solver
     solver.convergence_criterion = "incremental"
-    solver.rtol = 1.0e-8
-    solver.atol = 1.0e-8
-    solver.max_it = 25
+    solver.rtol = 1.0e-5
+    solver.atol = 1.0e-7
+    solver.max_it = 1000
     solver.report = True
     solver.relaxation_parameter = 1.0
     # Krylov solver
@@ -209,9 +209,8 @@ cell_params = {
         "Fc" : Fc, 
         "mech_model" : "elasticity",  
         "E" : E_ce,
-        "nu" : nu_ce,
-        "eta1" : eta1,
-        "eta2" : eta2,
+        "eta1" : eta1_ce,
+        "eta2" : eta2_ce,
         "k_n" : k_n,
         "factor" : factor,
         "alpha" : alpha,
@@ -234,7 +233,8 @@ n_params["Dia"] = nucleusDia
 n_params["Href"] = 2.0/nucleusDia
 n_params["opre0"] = opre0_n
 n_params["E"] = E_n
-n_params["nu"] = nu_n
+n_params["eta1"] = eta1_n
+n_params["eta2"] = eta2_n
 n_params["mech_model"] = "elasticity"
 #n_params["strength"] = 1e-06
 n_params["Fc"] = 1e-8
@@ -265,8 +265,8 @@ BendingEnergyList = [bending_energy]
 # Set up output {{{
 # Cell
 out_ce = Output(cellGS.domain, [cellGS.disp, cellGS.H_old, cellGS.normal,
-                                cellGS.selfRepuForce, cellGS.mechForce, cellGS.barrierForce, cellGS.movForce, cellGS.repulsiveForce, cellGS.retainForce, cellGS.phi, cellGS.bendingStiffness, cellGS.tensionStiffness],
-                ["u", "H", "n", "Fsr", "Fm", "Fbar", "Fc", "Frep", "Fret", "phi", "Fb", "Fs"],
+                                cellGS.selfRepuForce, cellGS.barrierForce, cellGS.mechForce, cellGS.movForce, cellGS.repulsiveForce, cellGS.retainForce, cellGS.phi, cellGS.bendingStiffness, cellGS.tensionStiffness],
+                ["u", "H", "n", "Fsr", "Fbar", "F_mech", "Frep", "Fret", "phi", "Fb", "Fs"],
                 results_name + "_ce", comm)
 timeList = [0.0]
 areaList_ce = [cellGS.area]
@@ -277,8 +277,8 @@ x_front = [cellDia/2]
 
 # Basement membrane
 out_n = Output(nGS.domain, [nGS.disp, nGS.H_old, nGS.normal,
-                              nGS.selfRepuForce, nGS.mechForce, nGS.barrierForce, nGS.nucleusForce, nGS.repulsiveForce, nGS.phi, nGS.bendingStiffness, nGS.tensionStiffness],
-                ["u", "H", "n", "Fsr", "Fm", "Fb", "Fn", "Frep", "phi", "Fb", "Fs"],
+                              nGS.selfRepuForce, nGS.barrierForce, nGS.mechForce, nGS.repulsiveForce, nGS.phi, nGS.bendingStiffness, nGS.tensionStiffness],
+                ["u", "H", "n", "Fsr", "Fb", "F_mech", "Frep", "phi", "Fb", "Fs"],
                 results_name + "_n", comm)
 areaList_n = [nGS.area]
 periList_n = [nGS.perimeter]
@@ -435,9 +435,9 @@ while (round(t + dt, 9) <= Ttot):
     x_center = compute_center(cellGS.domain)
     vel_norm = np.linalg.norm((x_center - x_center_old) / dt)
     velocityList_ce.append(vel_norm)
-    # Save stress
-    stressList_ce.append(cellGS.avg_sigma_n)
     x_center_old = x_center
+    # Save stress
+    #stressList_ce.append(cellGS.avg_sigma_n)
     # Save front
     x_front.append(cellGS.x_front)
     # Save surface energy
@@ -469,7 +469,7 @@ while (round(t + dt, 9) <= Ttot):
             "Peri_ce" : np.array(periList_ce),
             "Peri_n" : np.array(periList_n),
             "Vel_ce" : np.array(velocityList_ce),  
-            "Stress_ce" : np.array(stressList_ce),
+            #"Stress_ce" : np.array(stressList_ce),
             "x_front" : np.array(x_front),
             "surface_energy" : np.array(SurfaceEnergyList),
             "bending_energy" : np.array(BendingEnergyList)
@@ -480,6 +480,25 @@ while (round(t + dt, 9) <= Ttot):
 out_ce.Close()
 out_n.Close()
 
+# def figConfArea(fig, ax):
+#     ax.set_ylabel(r"$A$ [$\mu$m$^2$]")
+#     ax.legend([r"$A_\mathrm{cell}$", r"$A_\mathrm{n}$"])
+#     return fig, ax
+# fig, ax = Plot2DLines(data, ["Time"], ["Area_ce", "Area_n"], figConf = figConfArea)
+# fig.savefig("results/" + results_name + "_area.png", dpi=300, bbox_inches='tight')
+# def figConfPeri(fig, ax):
+#     ax.set_ylabel(r"$P$ [$\mu$m]")
+#     ax.legend([r"$P_\mathrm{cell}$", r"$P_\mathrm{n}$"])
+#     return fig, ax
+# fig, ax = Plot2DLines(data, ["Time"], ["Peri_ce", "Peri_n"], figConf = figConfPeri)
+# fig.savefig("results/" + results_name + "_peri.png", dpi = 300)
+# def figConfVel(fig, ax):
+#     ax.set_ylabel(r"$|\mathbf{v}_\mathrm{cell}|$ [$\mu$m/min]")
+#     ax.legend([r"$|\mathbf{v}_\mathrm{cell}|$"])
+#     return fig, ax
+# fig, ax = Plot2DLines(data, ["Time"], ["Vel_ce"], figConf = figConfVel)
+# fig.savefig("results/" + results_name + "_velocity.png", dpi = 300)
+# End analysis
 mprint("-----------------------------------------", rank = rank)
 mprint("End computation", rank = rank)
 # Report elapsed real time for the analysis
