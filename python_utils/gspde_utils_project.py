@@ -21,7 +21,7 @@ import os, sys
 import numpy as np
 import pandas as pd
 from datetime import datetime
-import pyvista
+import pyvista as pv
 import gmsh
 from shapely.geometry import Polygon
 from pdb import set_trace
@@ -72,9 +72,9 @@ class GSPDE(object):
         self.dimSpa = self.dimSur + 1
         # Data distribution
         self.imap = self.domain.geometry.index_map()
-        self.global_node_ids = self.imap.local_to_global(np.arange(self.domain.geometry.x.shape[0]))
+        self.global_node_ids = self.imap.local_to_global(np.arange(self.domain.geometry.x.shape[0], dtype=np.int32))        
         self.gather_global_node_ids = self.comm.allgather(self.global_node_ids)
-        local_node_ids = self.imap.global_to_local(np.arange(self.imap.size_global))
+        local_node_ids = np.arange(self.imap.size_local + self.imap.num_ghosts, dtype=np.int32)
         self.node_ids_arg = np.argwhere(local_node_ids >= 0).flatten()
         self.node_ids = local_node_ids[self.node_ids_arg]
         # Get number of nodes
@@ -91,7 +91,11 @@ class GSPDE(object):
         self.global_orderedNodeIds = OrderNodeList(connectivities[0, 0],
                                                    connectivities[0, 0],
                                                    connectivities, self.numEles)
-        local_orederedNodeIds = self.imap.global_to_local(self.global_orderedNodeIds)
+        all_local_indices = np.arange(self.imap.size_local + self.imap.num_ghosts, dtype=np.int32)
+        all_globals = self.imap.local_to_global(all_local_indices)
+        sort_idx = np.argsort(all_globals)
+        pos = np.searchsorted(all_globals[sort_idx], self.global_orderedNodeIds)
+        local_orederedNodeIds = all_local_indices[sort_idx[pos]]
         self.orderedNodeArg = np.argwhere(local_orederedNodeIds >= 0).flatten()
         self.orderedNodeIds = local_orederedNodeIds[self.orderedNodeArg]
         return
@@ -109,21 +113,27 @@ class GSPDE(object):
     # }}}
     # Set finite element spaces {{{
     def SetFESpaces(self):
-        meshOrder = self.kwargs["meshOrder"]
-        # Element types: quadratic scalar
-        ele_scalar = element("Lagrange", self.domain.basix_cell(), meshOrder)
-        self.V_scalar = fem.functionspace(self.domain, ele_scalar)
-        # Element types: quadratic vector
-        ele_u = element("Lagrange", self.domain.basix_cell(), meshOrder,
-                        shape = (self.dimSpa, ))
-        self.V_u = fem.functionspace(self.domain, ele_u)
-        # Element types: quadratic tensor
-        ele_T = element("Lagrange", self.domain.basix_cell(), meshOrder, shape=(self.dimSpa, self.dimSpa))
-        self.V_tensor = fem.functionspace(self.domain, ele_T)
-        # Mixed element
-        ele_mixed = basix.ufl.mixed_element([ele_u, ele_scalar])
-        self.V_mixed = fem.functionspace(self.domain, ele_mixed)
-        return
+            import ufl
+            import basix.ufl
+            meshOrder = self.kwargs["meshOrder"]
+            cell_type = self.domain.ufl_cell()
+
+            # Element types: scalar
+            ele_scalar = ufl.FiniteElement("Lagrange", cell_type, meshOrder)
+            self.V_scalar = fem.functionspace(self.domain, ele_scalar)
+
+            # Element types: vector
+            ele_u = ufl.VectorElement("Lagrange", cell_type, meshOrder, dim=self.dimSpa)
+            self.V_u = fem.functionspace(self.domain, ele_u)
+
+            # Element types: tensor
+            ele_T = ufl.TensorElement("Lagrange", cell_type, meshOrder, shape=(self.dimSpa, self.dimSpa))
+            self.V_tensor = fem.functionspace(self.domain, ele_T)
+
+            # Mixed element
+            ele_mixed = ufl.MixedElement([ele_u, ele_scalar])
+            self.V_mixed = fem.functionspace(self.domain, ele_mixed)
+            return
     # }}}
     # Set variables {{{
     def SetVariables(self):
@@ -143,7 +153,6 @@ class GSPDE(object):
         strength = self.kwargs["strength"]
         Fc = self.kwargs["Fc"]
         E = self.kwargs["E"] 
-        nu = self.kwargs["nu"] 
         eta1 = self.kwargs["eta1"] 
         eta2 = self.kwargs["eta2"] 
         k_n = self.kwargs["k_n"] 
@@ -169,7 +178,6 @@ class GSPDE(object):
         self.strength = strength
         self.Fc = Fc
         self.E = E
-        self.nu = nu
         self.eta1 = eta1
         self.eta2 = eta2
         self.k_n = k_n
@@ -182,6 +190,9 @@ class GSPDE(object):
         self.x_front_p = 1
         self.x_rear = -Dia/2
         self.x_rear_p = 1
+        self.eta_s = self.eta1 * self.eta2 / (self.eta1 + self.eta2)
+        self.eta_p = 2 * self.eta2**2 / (self.eta1 + self.eta2) 
+        self.tau = (self.eta1 + self.eta2) / self.E   
         # Constants
         self.dk = Constant(self.domain, PETSc.ScalarType(dt))
         self.t_constant = Constant(self.domain, PETSc.ScalarType(t))
@@ -193,10 +204,12 @@ class GSPDE(object):
         self.dw = TrialFunction(self.V_mixed)
         # Scalar functions
         self.H_old = Function(self.V_scalar)
+        self.V = Function(self.V_scalar)
         self.selfRepuForce = Function(self.V_scalar)
         self.bendingStiffness = Function(self.V_scalar)
         self.tensionStiffness = Function(self.V_scalar)
         self.barrierForce = Function(self.V_scalar)
+        self.T_p_old = fem.Function(self.V_scalar)
         self.mechForce = Function(self.V_scalar)
         self.movForce = Function(self.V_scalar)
         self.retainForce = Function(self.V_scalar)
@@ -245,14 +258,16 @@ class GSPDE(object):
         # Tension and bending stiffness
         self.bendingStiffness.x.array[:] = 1.0e-12
         self.tensionStiffness.x.array[:] = 1.0e-12
-        # Internal variable
-        self.eps_v_old = fem.Function(self.V_tensor)
-        self.eps_v_old.x.array[:] = 0.0
+        # Mechanical force
+        #self.eps_v_old = fem.Function(self.V_tensor)
+        #self.eps_v_old.x.array[:] = 0.0
+        #self.T_p_old.x.array[:] = 1.0e-12
     # }}}
     # Set weak form {{{
     def SetWeakForm(self, **kwargs):
         #Href = self.kwargs["Href"]
-        Mu = (self.omega/self.dk)*inner(inner(self.u - self.x_old, self.normal), self.H_test)*self.dx
+        #Mu = ((self.omega+2*self.eta_s*self.H**2)/self.dk)*inner(inner(self.u - self.x_old, self.normal), self.H_test)*self.dx
+        Mu = ((self.omega)/self.dk)*inner(inner(self.u - self.x_old, self.normal), self.H_test)*self.dx
         Su = self.bendingStiffness*inner(grad(self.H), grad(self.H_test))*self.dx
         Hpow2 = self.H_old**2.0
         #Hpow2 = Href**2.0 - self.H**2.0
@@ -371,72 +386,99 @@ class GSPDE(object):
         return
     # }}}
 
-    # Mechanical force
+    # # Mechanical force
+    # def MechForce(self):
+    #     self.u_diff = self.x - self.x0
+
+    #     typeModel = self.kwargs.get("mech_model", "elasticity")
+    #     if typeModel == "elasticity":
+    #         mu = self.E / (2 * (1 + self.nu))
+    #         lmbda = self.E * self.nu / ((1 + self.nu)*(1 - 2 * self.nu))
+
+    #         def epsilon(u):
+    #             return ufl.sym(ufl.grad(u))
+
+    #         def sigma(u):
+    #             return lmbda * ufl.tr(epsilon(u)) * ufl.Identity(self.dimSpa) + 2 * mu * epsilon(u)
+
+    #         # Proiezione della forza elastica lungo la normale
+    #         elastic_force_vector = ufl.dot(sigma(u_diff), self.normal)
+    #         scalar_normal_component = ufl.dot(elastic_force_vector, self.normal)
+    #         self.avg_sigma_n = fem.assemble_scalar(fem.form(scalar_normal_component * self.dx)) / fem.assemble_scalar(fem.form(1.0 * self.dx))
+
+    #         V_m = self.mechForce.function_space
+    #         q_m = ufl.TestFunction(V_m)
+    #         p_m = ufl.TrialFunction(V_m)
+
+    #         a_m = ufl.inner(p_m, q_m) * self.dx
+    #         L_m = ufl.inner(scalar_normal_component, q_m) * self.dx
+
+    #         problem_m = fem.petsc.LinearProblem(a_m, L_m, bcs=[], u=self.mechForce,
+    #                                         petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
+    #         problem_m.solve()
+
+    #     elif typeModel == "viscoelasticity":
+    #         tau = (self.eta1 + self.eta2) / self.E
+    #         tau2 = self.eta2 / self.E
+
+    #         def epsilon(u):
+    #              return ufl.sym(ufl.grad(u))
+
+    #         # formula UFL per il nuovo tensore viscoelastico
+    #         eps_v_new = (self.eps_v_old + (self.dt / tau2) * epsilon(u_diff)) / (1.0 + self.dt / tau)
+
+    #         # tensore di Cauchy: sigma = E (ε - ε^v)
+    #         stress_tensor = self.E * (epsilon(u_diff) - eps_v_new)
+    #         viscoelastic_force_vector = ufl.dot(stress_tensor, self.normal)
+    #         scalar_normal_component = ufl.dot(viscoelastic_force_vector, self.normal)
+    #         self.avg_sigma_n = fem.assemble_scalar(fem.form(scalar_normal_component * self.dx)) \
+    #                         / fem.assemble_scalar(fem.form(1.0 * self.dx))
+
+    #         # risolvo il problema per la forza
+    #         V_m = self.mechForce.function_space
+    #         q_m = ufl.TestFunction(V_m)
+    #         p_m = ufl.TrialFunction(V_m)
+
+    #         a_m = ufl.inner(p_m, q_m) * self.dx
+    #         L_m = ufl.inner(scalar_normal_component, q_m) * self.dx
+
+    #         problem_m = fem.petsc.LinearProblem(a_m, L_m, bcs=[], u=self.mechForce,
+    #                                             petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
+    #         problem_m.solve()
+
+    #         expr = fem.Expression(eps_v_new, self.V_tensor.element.interpolation_points())
+    #         self.eps_v_old.interpolate(expr)
+
+    #     return
+
+    # # }}} 
+
+    # Mechanical force (Nuovo Modello a Fluido Viscoelastico - Jeffreys)
     def MechForce(self):
-        u_diff = self.x - self.x0
+        V_formula = ufl.dot(self.u - self.x_old, self.normal) / self.dk
+        expr_V = fem.Expression(V_formula, self.V.function_space.element.interpolation_points())
+        self.V.interpolate(expr_V)
+        # Aggiornamento di T_p 
+        T_p_new = (self.T_p_old + (self.dk / self.tau) * self.eta_p * self.H * self.V) / (1.0 + self.dk / self.tau)
 
-        typeModel = self.kwargs.get("mech_model", "elasticity")
-        if typeModel == "elasticity":
-            mu = self.E / (2 * (1 + self.nu))
-            lmbda = self.E * self.nu / ((1 + self.nu)*(1 - 2 * self.nu))
+        polymeric_component = - T_p_new * self.H
 
-            def epsilon(u):
-                return ufl.sym(ufl.grad(u))
+        # Proiezione debole
+        V_m = self.mechForce.function_space
+        q_m = ufl.TestFunction(V_m)
+        p_m = ufl.TrialFunction(V_m)
 
-            def sigma(u):
-                return lmbda * ufl.tr(epsilon(u)) * ufl.Identity(self.dimSpa) + 2 * mu * epsilon(u)
+        a_m = ufl.inner(p_m, q_m) * self.dx
+        L_m = ufl.inner(polymeric_component, q_m) * self.dx
 
-            # Proiezione della forza elastica lungo la normale
-            elastic_force_vector = ufl.dot(sigma(u_diff), self.normal)
-            scalar_normal_component = ufl.dot(elastic_force_vector, self.normal)
-            self.avg_sigma_n = fem.assemble_scalar(fem.form(scalar_normal_component * self.dx)) / fem.assemble_scalar(fem.form(1.0 * self.dx))
-
-            V_m = self.mechForce.function_space
-            q_m = ufl.TestFunction(V_m)
-            p_m = ufl.TrialFunction(V_m)
-
-            a_m = ufl.inner(p_m, q_m) * self.dx
-            L_m = ufl.inner(scalar_normal_component, q_m) * self.dx
-
-            problem_m = fem.petsc.LinearProblem(a_m, L_m, bcs=[], u=self.mechForce,
+        problem_m = fem.petsc.LinearProblem(a_m, L_m, bcs=[], u=self.mechForce,
                                             petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
-            problem_m.solve()
+        problem_m.solve()
 
-        elif typeModel == "viscoelasticity":
-            tau = (self.eta1 + self.eta2) / self.E
-            tau2 = self.eta2 / self.E
-
-            def epsilon(u):
-                 return ufl.sym(ufl.grad(u))
-
-            # formula UFL per il nuovo tensore viscoelastico
-            eps_v_new = (self.eps_v_old + (self.dt / tau2) * epsilon(u_diff)) / (1.0 + self.dt / tau)
-
-            # tensore di Cauchy: sigma = E (ε - ε^v)
-            stress_tensor = self.E * (epsilon(u_diff) - eps_v_new)
-            viscoelastic_force_vector = ufl.dot(stress_tensor, self.normal)
-            scalar_normal_component = ufl.dot(viscoelastic_force_vector, self.normal)
-            self.avg_sigma_n = fem.assemble_scalar(fem.form(scalar_normal_component * self.dx)) \
-                            / fem.assemble_scalar(fem.form(1.0 * self.dx))
-
-            # risolvo il problema per la forza
-            V_m = self.mechForce.function_space
-            q_m = ufl.TestFunction(V_m)
-            p_m = ufl.TrialFunction(V_m)
-
-            a_m = ufl.inner(p_m, q_m) * self.dx
-            L_m = ufl.inner(scalar_normal_component, q_m) * self.dx
-
-            problem_m = fem.petsc.LinearProblem(a_m, L_m, bcs=[], u=self.mechForce,
-                                                petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
-            problem_m.solve()
-
-            expr = fem.Expression(eps_v_new, self.V_tensor.element.interpolation_points())
-            self.eps_v_old.interpolate(expr)
-
+        # Aggiornamento della history
+        expr = fem.Expression(T_p_new, self.T_p_old.function_space.element.interpolation_points())
+        self.T_p_old.interpolate(expr)
         return
-
-    # }}}
 
     ### External forces
     # Barrier force (both cell and nucleus)
@@ -843,7 +885,7 @@ def AdaptiveTimeSolver(ite, tf, dt, maxForceDiff, gspdes,
         # Evaluate current force
         global_currentForces = []
         for gspde_test in gspde_tests:
-            currentForce = gspde_test.barrierForce.x.array + gspde_test.selfRepuForce.x.array + gspde_test.movForce.x.array + gspde_test.mechForce.x.array + gspde_test.retainForce.x.array + gspde_test.nucleusForce.x.array + gspde_test.repulsiveForce.x.array
+            currentForce = gspde_test.barrierForce.x.array + gspde_test.selfRepuForce.x.array + gspde_test.movForce.x.array + gspde_test.retainForce.x.array + gspde_test.nucleusForce.x.array + gspde_test.repulsiveForce.x.array + gspde_test.mechForce.x.array
             global_currentForces.append(np.copy(gspde_test.GetGlobalArray(currentForce)))
         global_currentForce = np.hstack(global_currentForces)
         # Solve problems
@@ -864,7 +906,7 @@ def AdaptiveTimeSolver(ite, tf, dt, maxForceDiff, gspdes,
         # Compute future force
         global_futureForces = []
         for gspde_test in gspde_tests:
-            futureForce = gspde_test.barrierForce.x.array + gspde_test.selfRepuForce.x.array + gspde_test.movForce.x.array + gspde_test.mechForce.x.array + gspde_test.retainForce.x.array + gspde_test.nucleusForce.x.array + gspde_test.repulsiveForce.x.array 
+            futureForce = gspde_test.barrierForce.x.array + gspde_test.selfRepuForce.x.array + gspde_test.movForce.x.array + gspde_test.retainForce.x.array + gspde_test.nucleusForce.x.array + gspde_test.repulsiveForce.x.array + gspde_test.mechForce.x.array 
             global_futureForces.append(np.copy(gspde_test.GetGlobalArray(futureForce)))
         global_futureForce = np.hstack(global_futureForces)
         diffForce = np.linalg.norm(np.abs(global_futureForce - global_currentForce),
@@ -896,6 +938,10 @@ def AdaptiveTimeSolver(ite, tf, dt, maxForceDiff, gspdes,
                     test_dt = test_dt/2.0
                     test_t -= test_dt
                     # Go to previous solution
+                    for gspde_i, w_i in zip(gspdes, w_copy):
+                        gspde_i.w.x.array[:] = w_i[:]
+    return new_w
+# }}}Go to previous solution
                     for gspde_i, w_i in zip(gspdes, w_copy):
                         gspde_i.w.x.array[:] = w_i[:]
     return new_w
